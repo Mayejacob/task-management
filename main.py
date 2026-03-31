@@ -1,12 +1,28 @@
+import asyncio
 from dataclasses import Field
+from http.client import HTTPException
+import random
 from urllib import response
-from fastapi import FastAPI, status, Query, Depends
+from urllib.request import Request
+from fastapi import FastAPI, status, Query, Depends, BackgroundTasks, UploadFile, WebSocket, WebSocketDisconnect, Response
 from pydantic import BaseModel, validator, ValidationError, field_validator, computed_field, model_validator
 from typing import Annotated
 from datetime import datetime
 import uvicorn
 from dependencies import get_current_user
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
+import logging
+from pathlib import Path
+import shutil
+import uuid
+from websocket_manager import manager
 
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+
+)
 app = FastAPI()
 
 @app.get("/")
@@ -93,7 +109,7 @@ async def get_task(task_id: int):
     }
 
 class TaskCreate(BaseModel):
-    title: str = Annotated[str, Field(min_length=1, max_length=100)],
+    title: str 
     status: str
     priority: str
     due_date: str
@@ -148,7 +164,7 @@ class TaskCreate(BaseModel):
     
     # ConfigDict
     class Config:
-        anystr_strip_whitespace = True
+        str_strip_whitespace = True
         extra = "forbid"
         from_attributes = True
         str_to_lower = True
@@ -171,20 +187,38 @@ async def create_task(task: TaskCreate):
 
     return new_task
 
-@app.post("/tasks", response_model=TaskResponse)
-async def create_task(task: TaskCreate, current_user: dict = Depends(get_current_user)):
+@app.post("/tasks")
+async def create_task(
+    task: TaskCreate, 
+    current_user: dict = Depends(get_current_user),
+    response: Response = None
+    ):
    
-    response.header("X-user-id", str(current_user["id"]))
-    
     new_task = {
         "id": len(tasks) + 1,
         **task.model_dump()
     }
     tasks.append(new_task)
 
-    # cookies
-    response.set_cookies(key="user_id", value=str(current_user["id"]), httponly=True, max_age=3600)
+    # broadcast to all client
+    await manager.broadcast({
+        "event": "task_created",
+        "message": f"New task added: {task.title}",
+        "task": new_task
+    })
 
+    if response:
+        response.headers["X-User-Id"] = str(current_user.get("id", ""))
+
+    # === Fix 2: Set cookie (Correct method name) ===
+    if response:
+        response.set_cookie(
+            key="user_id",
+            value=str(current_user.get("id", "")),
+            httponly=True,
+            max_age=3600,          # 1 hour
+            samesite="lax"
+        )
 
     return {
         "message": "task created successfully",
@@ -196,6 +230,130 @@ async def create_task(task: TaskCreate, current_user: dict = Depends(get_current
         }
     }
 
+UPLOAD_DIR = Path("files")
+UPLOAD_DIR.mkdir(exist_ok=True)
+
+async def process_file(file_path: str, task_id: id):
+    print(f"processing started for {task_id}: {file_path}")
+    # Simulate file processing
+    import asyncio
+    random_delay = random.randint(1, 5)
+
+    await asyncio.sleep(random_delay)
+
+    print(f"processing completed for {task_id}: {file_path}")
+# Background Tasks & File Uploads with UploadFile + background task to "process" file.
+@app.post("/task/{task_id}/upload")
+async def upload_file(
+    task_id: int, 
+    file: UploadFile, 
+    background_tasks: BackgroundTasks
+    ):
+    task = next((task for task in tasks if task["id"] == task_id), None)
+    if not task:
+        return {
+            "message": "Task not found",
+            "success": False,
+            "status": 404
+        }
+    
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="No file uploaded")
+    
+    safe_filename = f"{uuid.uuid4()}_{file.filename}"
+    file_location = UPLOAD_DIR / safe_filename
+    
+    try: 
+        with open(file_location, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+
+            background_tasks.add_task(process_file, str(file_location), task_id)
+
+            return {
+                "message": "file uploaded successfully",
+                "success": True,
+                "status": status.HTTP_201_CREATED,
+                "data": {
+                    "task_id": task_id,
+                    "filename": file.filename,
+                    "saved_as": str(file_location)
+                }
+            }
+    except Exception as e:
+        if file_location.exists():
+            file_location.unlink(missing_ok=True)
+        raise HTTPException(status_code=500, detail=f"File upload failed: {str(e)}")
+
+@app.post("/simulate_background_task")
+async def simulate_background_task(
+    background_tasks: BackgroundTasks,
+    minutes: int = 5,
+):
+    delay_minutes = random.randint(1, minutes) if minutes > 1 else 1
+    delay_seconds = delay_minutes * 60
+
+    started_at = datetime.now().isoformat()
+    background_tasks.add_task(long_running_task, delay_seconds)
+
+    return {
+        "message": f"Background task scheduled to run in {delay_minutes} minute(s)",
+        "success": True,
+        "status": 200,
+        "data": {
+            "estimated_delay_minutes": delay_minutes,
+            "started_at": started_at
+        }
+    }
+
+async def long_running_task(delay_seconds: int):
+    task_id = random.randint(1000, 9999)
+    print(f"Background task {task_id} started, will run for {delay_seconds}")
+    await asyncio.sleep(delay_seconds)
+
+    print(f"[{datetime.now().isoformat()}] Background task {task_id} completed after {delay_seconds // 60} minute(s)")
+
+
+@app.websocket("/ws/tasks")
+async def websocket_tasks_endpoint(websocket: WebSocket):
+    await manager.connect(websocket)
+    print(f"New client connected. Total Clients {len(manager.active_connections)}")
+
+    try:
+        while True:
+            data = await websocket.receive_text()
+
+            await websocket.send_text(f"Echo: {data}")
+
+    except WebSocketDisconnect:
+        manager.disconnect(websocket)
+        print(f"Client disconnected. Remaining clients {manager.active_connections}")
+    
+    except Exception as e:
+        print(f"websocket error: {e}")
+        manager.disconnect(websocket)
+
+
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    logger = logging.getLogger(__name__)
+    logger.info(f"Request: {request.method} {request.url}")
+    response = await call_next(request)
+    logger.info(f"Response: {response.status_code} for {request.url}")
+    return response
+
+app.add_middleware(GZipMiddleware, minimum_size=1000)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:8000",
+        "http://127.0.0.1:8000",
+        "*"
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
+
