@@ -1,11 +1,11 @@
-from fastapi import FastAPI, status, Query
-from pydantic import BaseModel, validator, ValidationError, field_validator
-
+from dataclasses import Field
+from urllib import response
+from fastapi import FastAPI, status, Query, Depends
+from pydantic import BaseModel, validator, ValidationError, field_validator, computed_field, model_validator
+from typing import Annotated
 from datetime import datetime
 import uvicorn
-
-
-
+from dependencies import get_current_user
 
 app = FastAPI()
 
@@ -93,11 +93,36 @@ async def get_task(task_id: int):
     }
 
 class TaskCreate(BaseModel):
-    title: str
+    title: str = Annotated[str, Field(min_length=1, max_length=100)],
     status: str
     priority: str
     due_date: str
 
+    
+    @model_validator(mode="before")
+    @classmethod
+    def validate_all_fields(cls, values):
+        if "title" not in values or not values["title"].strip():
+            raise ValueError("title is required and cannot be empty")
+        return values
+    @model_validator(mode="after")
+    @classmethod
+    def validate_combined_fields(cls, values):
+        if values.status == "completed" and values.due_date > datetime.now().strftime("%Y-%m-%d"):
+            raise ValueError("completed tasks cannot have a due date in the future")
+        return values
+    
+    @model_validator(mode="after")
+    @classmethod
+    def validate_is_overdue(cls, values):
+        if values.is_overdue and values.status != "completed":
+            raise ValueError("overdue tasks must be marked as completed")
+        return values
+
+    @computed_field
+    def is_overdue(self) -> bool:
+        return datetime.strptime(self.due_date, "%Y-%m-%d") < datetime.now()
+    
     @field_validator("status")
     @classmethod
     def validate_status(cls, value):
@@ -121,6 +146,12 @@ class TaskCreate(BaseModel):
             raise ValueError("due_date must be in the format YYYY-MM-DD")
         return value
     
+    # ConfigDict
+    class Config:
+        anystr_strip_whitespace = True
+        extra = "forbid"
+        from_attributes = True
+        str_to_lower = True
 
 
 class TaskResponse(BaseModel):
@@ -141,7 +172,9 @@ async def create_task(task: TaskCreate):
     return new_task
 
 @app.post("/tasks", response_model=TaskResponse)
-async def create_task(task: TaskCreate):
+async def create_task(task: TaskCreate, current_user: dict = Depends(get_current_user)):
+   
+    response.header("X-user-id", str(current_user["id"]))
     
     new_task = {
         "id": len(tasks) + 1,
@@ -149,11 +182,18 @@ async def create_task(task: TaskCreate):
     }
     tasks.append(new_task)
 
+    # cookies
+    response.set_cookies(key="user_id", value=str(current_user["id"]), httponly=True, max_age=3600)
+
+
     return {
         "message": "task created successfully",
         "success": True,
         "status": status.HTTP_201_CREATED,
-        "data": new_task
+        "data": {
+            "new_task": new_task,
+            "user": current_user
+        }
     }
 
 
